@@ -1,0 +1,857 @@
+package provider
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework-validators/boolvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	stringvalidator "github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
+	"github.com/okoye-ai/terraform-provider-multipass/internal/models"
+	"github.com/okoye-ai/terraform-provider-multipass/internal/multipasscli"
+)
+
+// Ensure implementation satisfies interfaces.
+var (
+	_ resource.Resource                = (*instanceResource)(nil)
+	_ resource.ResourceWithConfigure   = (*instanceResource)(nil)
+	_ resource.ResourceWithImportState = (*instanceResource)(nil)
+	_ resource.ResourceWithModifyPlan  = (*instanceResource)(nil)
+)
+
+// NewInstanceResource registers the resource with the provider.
+func NewInstanceResource() resource.Resource {
+	return &instanceResource{}
+}
+
+type instanceResource struct {
+	client         multipasscli.Client
+	defaultImage   string
+	commandTimeout time.Duration
+}
+
+func (r *instanceResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_instance"
+}
+
+func (r *instanceResource) Schema(ctx context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Description: "Manages Canonical Multipass instances.",
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"name": schema.StringAttribute{
+				Required:            true,
+				Description:         "Instance name.",
+				MarkdownDescription: "Instance name. Must be unique per Multipass host.",
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
+			},
+			"image": schema.StringAttribute{
+				Optional:            true,
+				Description:         "Image alias or name (e.g., `lts`, `jammy`, `24.04`). Defaults to provider `default_image`.",
+				MarkdownDescription: "Image alias or name (e.g., `lts`, `jammy`, `24.04`). Defaults to provider `default_image`.",
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
+			},
+			"cpus": schema.Int64Attribute{
+				Optional:            true,
+				Computed:            true,
+				Description:         "Virtual CPU count. Defaults to 1 at creation; omission retains the existing allocation. Changes follow resize_policy.",
+				MarkdownDescription: "Virtual CPU count. Defaults to 1 at creation; omission retains the existing allocation. Changes follow `resize_policy`.",
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseNonNullStateForUnknown(),
+				},
+				Validators: []validator.Int64{int64validator.AtLeast(1)},
+			},
+			"memory": schema.StringAttribute{
+				Optional:            true,
+				Computed:            true,
+				Description:         "Memory size (e.g., 1G, 512M, or bytes). Defaults to 1G at creation; omission retains the allocation. Changes follow resize_policy.",
+				MarkdownDescription: "Memory size (e.g., `1G`, `512M`, or bytes). Defaults to `1G` at creation; omission retains the allocation. Changes follow `resize_policy`.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseNonNullStateForUnknown(),
+				},
+				Validators: []validator.String{
+					allocationSizeValidator{},
+				},
+			},
+			"disk": schema.StringAttribute{
+				Optional:            true,
+				Computed:            true,
+				Description:         "Disk allocation (e.g., 5G or bytes). Defaults to 5G at creation; omission retains the allocation. In-place resizing only permits growth.",
+				MarkdownDescription: "Disk allocation (e.g., `5G` or bytes). Defaults to `5G` at creation; omission retains the allocation. In-place resizing only permits growth.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseNonNullStateForUnknown(),
+				},
+				Validators: []validator.String{
+					allocationSizeValidator{},
+				},
+			},
+			"resize_policy": schema.StringAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     stringdefault.StaticString("in_place"),
+				Description: "How CPU, memory, and disk changes are applied: in_place (default) stops and resizes the VM, restarting it only if previously running; replace recreates it. Changing only this policy does not restart or replace the VM.",
+				Validators:  []validator.String{stringvalidator.OneOf("in_place", "replace")},
+			},
+			"cloud_init_file": schema.StringAttribute{
+				Optional:            true,
+				Description:         "Path to a cloud-init YAML file applied at launch. Mutually exclusive with `cloud_init`. Forces recreation.",
+				MarkdownDescription: "Path to a cloud-init YAML file applied at launch. Mutually exclusive with `cloud_init`. Forces recreation.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"cloud_init": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				Description:         "Inline cloud-init YAML applied at launch. Mutually exclusive with `cloud_init_file`. Forces recreation.",
+				MarkdownDescription: "Inline cloud-init YAML applied at launch. Mutually exclusive with `cloud_init_file`. Forces recreation.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"primary": schema.BoolAttribute{
+				Optional:            true,
+				Description:         "If true, mark this instance as the Multipass primary instance after creation.",
+				MarkdownDescription: "If true, mark this instance as the Multipass primary instance after creation.",
+			},
+			"auto_recover": schema.BoolAttribute{
+				Optional:            true,
+				Description:         "Attempt to recover the instance if it becomes deleted outside Terraform.",
+				MarkdownDescription: "Attempt to recover the instance if it becomes deleted outside Terraform.",
+			},
+			"auto_start_on_recover": schema.BoolAttribute{
+				Optional:            true,
+				Description:         "If true, automatically start the instance after a successful auto-recover when it was soft-deleted outside Terraform.",
+				MarkdownDescription: "If true, automatically start the instance after a successful auto-recover when it was soft-deleted outside Terraform.",
+			},
+			"wait_for_cloud_init": schema.BoolAttribute{
+				Optional:            true,
+				Description:         "Wait for cloud-init to finish after launch before marking the resource as created. Useful when downstream resources depend on packages or configuration applied by cloud-init.",
+				MarkdownDescription: "Wait for cloud-init to finish after launch before marking the resource as created. Useful when downstream resources depend on packages or configuration applied by cloud-init.",
+			},
+			"ipv4": schema.ListAttribute{
+				Computed:            true,
+				Description:         "Assigned IPv4 addresses.",
+				MarkdownDescription: "Assigned IPv4 addresses as reported by `multipass info`.",
+				ElementType:         types.StringType,
+			},
+			"state": schema.StringAttribute{
+				Computed:            true,
+				Description:         "Current power state.",
+				MarkdownDescription: "Current power state reported by Multipass.",
+			},
+			"release": schema.StringAttribute{
+				Computed:            true,
+				Description:         "Operating system release running in the instance.",
+				MarkdownDescription: "Operating system release running in the instance.",
+			},
+			"image_release": schema.StringAttribute{
+				Computed:            true,
+				Description:         "Release name pulled from the image metadata.",
+				MarkdownDescription: "Release name pulled from the image metadata.",
+			},
+			"snapshot_count": schema.Int64Attribute{
+				Computed:            true,
+				Description:         "Number of snapshots recorded for this instance.",
+				MarkdownDescription: "Number of snapshots recorded for this instance.",
+			},
+			"last_updated": schema.StringAttribute{
+				Computed:            true,
+				Description:         "Timestamp of the last information refresh.",
+				MarkdownDescription: "Timestamp of the last information refresh in RFC3339 format.",
+			},
+		},
+		Blocks: map[string]schema.Block{
+			"networks": schema.ListNestedBlock{
+				Description: "Optional networks to attach during launch.",
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.RequiresReplace(),
+				},
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"name": schema.StringAttribute{
+							Required:    true,
+							Description: "Host network name (from `multipass networks`).",
+						},
+						"mode": schema.StringAttribute{
+							Optional:    true,
+							Description: "Attachment mode (auto/manual).",
+						},
+						"mac": schema.StringAttribute{
+							Optional:    true,
+							Description: "Explicit MAC address to assign.",
+						},
+					},
+				},
+			},
+			"mounts": schema.ListNestedBlock{
+				Description: "Host directory mounts to attach at launch.",
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"host_path": schema.StringAttribute{
+							Required:    true,
+							Description: "Absolute or relative path on the host to mount.",
+						},
+						"instance_path": schema.StringAttribute{
+							Required:    true,
+							Description: "Absolute path inside the instance where the host path is mounted.",
+						},
+						"read_only": schema.BoolAttribute{
+							Optional:    true,
+							Description: "Must be false or omitted. The Multipass CLI does not support read-only mounts.",
+							Validators:  []validator.Bool{boolvalidator.Equals(false)},
+						},
+					},
+				},
+			},
+			"timeouts": timeouts.Block(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Update: true,
+				Delete: true,
+			}),
+		},
+	}
+}
+
+func (r *instanceResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+
+	data := req.ProviderData.(providerData)
+	r.client = data.client
+	r.defaultImage = data.defaultImage
+	r.commandTimeout = data.commandTimeout
+}
+
+func (r *instanceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "The provider Multipass client was not configured.")
+		return
+	}
+
+	var plan instanceResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	createTimeout, diags := plan.Timeouts.Create(ctx, r.commandTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if hasStringValue(plan.CloudInitFile) && hasStringValue(plan.CloudInit) {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("cloud_init"),
+			"Conflicting cloud-init configuration",
+			"Only one of cloud_init or cloud_init_file can be set. Remove one of the attributes and try again.",
+		)
+		return
+	}
+
+	launchMemory := valueOrDefaultString(plan.Memory, "1G")
+	launchDisk := valueOrDefaultString(plan.Disk, "5G")
+	memoryBytes, err := multipasscli.ParseSize(launchMemory)
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("memory"), "Invalid allocation size", err.Error())
+		return
+	}
+	diskBytes, err := multipasscli.ParseSize(launchDisk)
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("disk"), "Invalid allocation size", err.Error())
+		return
+	}
+	opts := models.LaunchOptions{
+		Name:            plan.Name.ValueString(),
+		Image:           r.resolveImage(plan.Image),
+		CPUs:            valueOrDefaultInt(plan.CPUs, 1),
+		Memory:          strconv.FormatUint(memoryBytes, 10),
+		Disk:            strconv.FormatUint(diskBytes, 10),
+		CloudInitFile:   valueOrEmpty(plan.CloudInitFile),
+		CloudInitInline: valueOrEmpty(plan.CloudInit),
+		Networks:        expandNetworkAttachments(plan.Networks),
+		Mounts:          expandMounts(plan.Mounts),
+		Primary:         plan.Primary.ValueBool(),
+	}
+	if plan.ResizePolicy.IsNull() || plan.ResizePolicy.IsUnknown() {
+		plan.ResizePolicy = types.StringValue("in_place")
+	}
+
+	// Use a dedicated context for the launch so the original ctx stays
+	// alive for recovery, SetPrimary, and refreshState after a timeout.
+	createCtx, createCancel := context.WithTimeout(ctx, createTimeout)
+	defer createCancel()
+
+	if err := r.client.LaunchInstance(createCtx, opts); err != nil {
+		if !errors.Is(err, multipasscli.ErrTimeout) {
+			resp.Diagnostics.AddError("Failed to launch instance", err.Error())
+			return
+		}
+
+		// Launch timed out. The Multipass daemon may still be creating the
+		// instance in the background. Poll to see if it becomes available.
+		tflog.Warn(ctx, "Launch command timed out, checking if instance was created by daemon", map[string]any{
+			"name": opts.Name,
+		})
+
+		recoveryTimeout := 5 * time.Minute
+		recoveryCtx, recoveryCancel := context.WithTimeout(ctx, recoveryTimeout)
+		defer recoveryCancel()
+		if recoverErr := r.waitForInstanceAfterTimeout(recoveryCtx, opts.Name, recoveryTimeout); recoverErr != nil {
+			resp.Diagnostics.AddError(
+				"Launch timed out and instance not found",
+				fmt.Sprintf(
+					"The launch command timed out and the instance %q could not be found after waiting an additional %s. "+
+						"Consider increasing the provider command_timeout or check 'multipass list' to see if the instance is still being created. "+
+						"Original error: %s",
+					opts.Name, recoveryTimeout, err.Error(),
+				),
+			)
+			return
+		}
+
+		resp.Diagnostics.AddWarning(
+			"Launch timed out but instance was created",
+			fmt.Sprintf("The launch command timed out, but instance %q was successfully created by the Multipass daemon.", opts.Name),
+		)
+	}
+
+	// Launch succeeded: persist the VM even if allocation readback or cloud-init
+	// subsequently fails. Resolve computed launch defaults and initialize remote
+	// metadata so a failed refresh cannot leave unknown values in saved state.
+	plan.ID = types.StringValue(opts.Name)
+	plan.CPUs = types.Int64Value(int64(opts.CPUs))
+	plan.Memory = types.StringValue(launchMemory)
+	plan.Disk = types.StringValue(launchDisk)
+	plan.State = types.StringNull()
+	plan.Release = types.StringNull()
+	plan.ImageRelease = types.StringNull()
+	plan.SnapshotCount = types.Int64Null()
+	plan.LastUpdated = types.StringNull()
+	plan.IPv4 = types.ListNull(types.StringType)
+	defer func() {
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	}()
+
+	if plan.WaitForCloudInit.ValueBool() {
+		tflog.Info(ctx, "Waiting for cloud-init to finish", map[string]any{"name": opts.Name})
+		if err := r.waitForCloudInit(createCtx, opts.Name); err != nil {
+			// The VM already exists. Persist it before returning an error so
+			// Terraform can clean up or replace the failed creation, while
+			// preventing dependent resources from running.
+			resp.Diagnostics.Append(r.refreshState(ctx, opts.Name, &plan)...)
+			resp.Diagnostics.AddError("cloud-init wait failed", err.Error())
+			return
+		}
+	}
+
+	if opts.Primary {
+		if err := r.client.SetPrimary(ctx, opts.Name); err != nil {
+			resp.Diagnostics.AddWarning("Failed to set primary", err.Error())
+		}
+	}
+
+	refreshDiags := r.refreshState(ctx, opts.Name, &plan)
+	resp.Diagnostics.Append(refreshDiags...)
+}
+
+func (r *instanceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "The provider Multipass client was not configured.")
+		return
+	}
+
+	var state instanceResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	readTimeout, diags := state.Timeouts.Read(ctx, r.commandTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	name := state.Name.ValueString()
+	instance, err := r.client.GetInstance(ctx, name)
+
+	// If the instance is missing and auto_recover is enabled, attempt a recover.
+	if errors.Is(err, multipasscli.ErrNotFound) && state.AutoRecover.ValueBool() {
+		if recErr := r.client.RecoverInstance(ctx, name); recErr != nil {
+			resp.Diagnostics.AddWarning("Failed to auto-recover instance", recErr.Error())
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		instance, err = r.client.GetInstance(ctx, name)
+
+		// Optionally start the instance after a successful recover.
+		if err == nil && state.AutoStartOnRecover.ValueBool() && !strings.EqualFold(instance.State, "Running") {
+			if startErr := r.client.StartInstance(ctx, name); startErr != nil {
+				resp.Diagnostics.AddWarning("Failed to auto-start instance after recover", startErr.Error())
+			} else {
+				instance, err = r.client.GetInstance(ctx, name)
+			}
+		}
+	}
+
+	if err != nil {
+		if errors.Is(err, multipasscli.ErrNotFound) {
+			tflog.Info(ctx, "Multipass instance no longer exists", map[string]any{"name": name})
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		// multipass info requires SSH which is unavailable on stopped or
+		// booting instances.  Fall back to multipass list which only
+		// queries the daemon, same as refreshState does.
+		tflog.Warn(ctx, "multipass info failed in Read, falling back to list", map[string]any{"name": name, "error": err.Error()})
+		instance, err = r.getInstanceFromList(ctx, name)
+		if err != nil {
+			resp.Diagnostics.AddError("Failed to read instance", err.Error())
+			return
+		}
+	}
+
+	// Multipass keeps "soft-deleted" instances around with a Deleted state that can be
+	// recovered via `multipass recover`. If auto_recover is enabled, transparently
+	// recover such instances so Terraform can continue managing them.
+	if state.AutoRecover.ValueBool() && strings.EqualFold(instance.State, "Deleted") {
+		if recErr := r.client.RecoverInstance(ctx, name); recErr != nil {
+			resp.Diagnostics.AddWarning("Failed to auto-recover soft-deleted instance", recErr.Error())
+		} else {
+			instance, err = r.client.GetInstance(ctx, name)
+			if err != nil {
+				resp.Diagnostics.AddError("Failed to read instance after auto-recover", err.Error())
+				return
+			}
+
+			// Optionally start the instance after a successful recover from Deleted state.
+			if state.AutoStartOnRecover.ValueBool() && !strings.EqualFold(instance.State, "Running") {
+				if startErr := r.client.StartInstance(ctx, name); startErr != nil {
+					resp.Diagnostics.AddWarning("Failed to auto-start instance after recover", startErr.Error())
+				} else {
+					instance, err = r.client.GetInstance(ctx, name)
+					if err != nil {
+						resp.Diagnostics.AddError("Failed to read instance after auto-start", err.Error())
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// Ensure id is always set — important after import where only name is populated.
+	state.ID = types.StringValue(name)
+	resp.Diagnostics.Append(applyInstanceToModel(ctx, instance, &state)...)
+	resp.Diagnostics.Append(r.refreshAllocations(ctx, name, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+func (r *instanceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "The provider Multipass client was not configured.")
+		return
+	}
+
+	var plan instanceResourceModel
+	var state instanceResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// A value that was unknown during validation can resolve to true at
+	// apply time. Reject it before unmounting the existing configuration.
+	for i, mount := range plan.Mounts {
+		if mount.ReadOnly.ValueBool() {
+			resp.Diagnostics.AddAttributeError(path.Root("mounts").AtListIndex(i).AtName("read_only"),
+				"Unsupported read-only mount", "The Multipass CLI does not support read-only mounts. Set read_only to false or omit it.")
+			return
+		}
+	}
+
+	updateTimeout, diags := plan.Timeouts.Update(ctx, r.commandTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	requestCtx := ctx
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
+	if hasStringValue(plan.CloudInitFile) && hasStringValue(plan.CloudInit) {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("cloud_init"),
+			"Conflicting cloud-init configuration",
+			"Only one of cloud_init or cloud_init_file can be set. Remove one of the attributes and try again.",
+		)
+		return
+	}
+
+	// Keep confirmed allocations even when a subsequent primary or mount update
+	// fails. Never persist the whole plan on an unsuccessful update.
+	defer func() {
+		if resp.Diagnostics.HasError() {
+			resp.Diagnostics.Append(resp.State.Set(requestCtx, &state)...)
+		}
+	}()
+	resp.Diagnostics.Append(r.resizeInstance(requestCtx, ctx, &plan, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if plan.Primary.ValueBool() && !state.Primary.ValueBool() {
+		if err := r.client.SetPrimary(ctx, plan.Name.ValueString()); err != nil {
+			resp.Diagnostics.AddError("Failed to set primary", err.Error())
+			return
+		}
+		state.Primary = plan.Primary
+	}
+
+	toAdd, toRemove := diffMounts(plan.Mounts, state.Mounts)
+	if len(toAdd) > 0 || len(toRemove) > 0 {
+		// Simplify lifecycle: unmount all current mounts, then recreate the
+		// desired set from the plan. This avoids depending on per-path umount
+		// semantics and guarantees the final set matches Terraform config.
+		if err := r.client.Unmount(ctx, plan.Name.ValueString(), models.Mount{}); err != nil {
+			resp.Diagnostics.AddError("Failed to unmount existing mounts", err.Error())
+			return
+		}
+
+		for _, m := range plan.Mounts {
+			if err := r.client.Mount(ctx, plan.Name.ValueString(), mountConfigToModel(m)); err != nil {
+				resp.Diagnostics.AddError("Failed to mount directory", err.Error())
+				return
+			}
+		}
+		state.Mounts = plan.Mounts
+	}
+
+	refreshDiags := r.refreshState(ctx, plan.Name.ValueString(), &plan)
+	resp.Diagnostics.Append(refreshDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+func (r *instanceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	if r.client == nil {
+		resp.Diagnostics.AddError("Client not configured", "The provider Multipass client was not configured.")
+		return
+	}
+
+	var state instanceResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	deleteTimeout, diags := state.Timeouts.Delete(ctx, r.commandTimeout)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+
+	name := state.Name.ValueString()
+	if err := r.client.DeleteInstance(ctx, name, true); err != nil {
+		if errors.Is(err, multipasscli.ErrNotFound) {
+			return
+		}
+		resp.Diagnostics.AddError("Failed to delete instance", err.Error())
+	}
+}
+
+func (r *instanceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+}
+
+func (r *instanceResource) refreshState(ctx context.Context, name string, model *instanceResourceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+	instance, err := r.client.GetInstance(ctx, name)
+	if err != nil {
+		// multipass info failed (requires SSH). Fall back to multipass list
+		// which only queries the daemon. This populates core attributes
+		// (name, state, ipv4, release) while info-only fields (load,
+		// cpu_count, memory_bytes, etc.) remain empty until the next refresh.
+		tflog.Warn(ctx, "multipass info failed, falling back to list", map[string]any{"name": name, "error": err.Error()})
+		instance, err = r.getInstanceFromList(ctx, name)
+		if err != nil {
+			diags.AddError("Failed to refresh instance state", err.Error())
+			return diags
+		}
+		diags.AddWarning(
+			"Instance state partially refreshed",
+			fmt.Sprintf("Could not query instance %q via 'multipass info' (SSH may not be ready). "+
+				"Core attributes (name, state, ipv4) are populated from 'multipass list'. "+
+				"Run 'tofu refresh' later to populate remaining attributes.", name),
+		)
+	}
+
+	model.ID = types.StringValue(name)
+	model.Name = types.StringValue(name)
+	diags.Append(applyInstanceToModel(ctx, instance, model)...)
+	diags.Append(r.refreshAllocations(ctx, name, model)...)
+	return diags
+}
+
+// getInstanceFromList finds an instance by name using ListInstances (no SSH).
+func (r *instanceResource) getInstanceFromList(ctx context.Context, name string) (*models.Instance, error) {
+	instances, err := r.client.ListInstances(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list instances: %w", err)
+	}
+	for i := range instances {
+		if instances[i].Name == name {
+			return &instances[i], nil
+		}
+	}
+	return nil, fmt.Errorf("instance %q not found in list", name)
+}
+
+func applyInstanceToModel(ctx context.Context, instance *models.Instance, model *instanceResourceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	model.State = types.StringValue(instance.State)
+	model.Release = types.StringValue(instance.Release)
+	model.ImageRelease = types.StringValue(instance.ImageRelease)
+	model.SnapshotCount = types.Int64Value(int64(instance.SnapshotCount))
+	model.LastUpdated = types.StringValue(instance.LastUpdated.UTC().Format(time.RFC3339))
+
+	if len(instance.IPv4) > 0 {
+		list, diag := types.ListValueFrom(ctx, types.StringType, instance.IPv4)
+		diags.Append(diag...)
+		model.IPv4 = list
+	} else {
+		model.IPv4 = types.ListNull(types.StringType)
+	}
+
+	return diags
+}
+
+// Helpers
+
+type networkConfigModel struct {
+	Name types.String `tfsdk:"name"`
+	Mode types.String `tfsdk:"mode"`
+	Mac  types.String `tfsdk:"mac"`
+}
+
+type mountConfigModel struct {
+	HostPath     types.String `tfsdk:"host_path"`
+	InstancePath types.String `tfsdk:"instance_path"`
+	ReadOnly     types.Bool   `tfsdk:"read_only"`
+}
+
+type instanceResourceModel struct {
+	ID                 types.String         `tfsdk:"id"`
+	Name               types.String         `tfsdk:"name"`
+	Image              types.String         `tfsdk:"image"`
+	CPUs               types.Int64          `tfsdk:"cpus"`
+	Memory             types.String         `tfsdk:"memory"`
+	Disk               types.String         `tfsdk:"disk"`
+	ResizePolicy       types.String         `tfsdk:"resize_policy"`
+	CloudInitFile      types.String         `tfsdk:"cloud_init_file"`
+	CloudInit          types.String         `tfsdk:"cloud_init"`
+	Primary            types.Bool           `tfsdk:"primary"`
+	AutoRecover        types.Bool           `tfsdk:"auto_recover"`
+	AutoStartOnRecover types.Bool           `tfsdk:"auto_start_on_recover"`
+	WaitForCloudInit   types.Bool           `tfsdk:"wait_for_cloud_init"`
+	Networks           []networkConfigModel `tfsdk:"networks"`
+	Mounts             []mountConfigModel   `tfsdk:"mounts"`
+	Timeouts           timeouts.Value       `tfsdk:"timeouts"`
+	IPv4               types.List           `tfsdk:"ipv4"`
+	State              types.String         `tfsdk:"state"`
+	Release            types.String         `tfsdk:"release"`
+	ImageRelease       types.String         `tfsdk:"image_release"`
+	SnapshotCount      types.Int64          `tfsdk:"snapshot_count"`
+	LastUpdated        types.String         `tfsdk:"last_updated"`
+}
+
+func (r *instanceResource) resolveImage(image types.String) string {
+	if !image.IsNull() && !image.IsUnknown() && image.ValueString() != "" {
+		return image.ValueString()
+	}
+	if r.defaultImage != "" {
+		return r.defaultImage
+	}
+	return "lts"
+}
+
+func expandNetworkAttachments(configs []networkConfigModel) []models.NetworkAttachment {
+	result := make([]models.NetworkAttachment, 0, len(configs))
+	for _, m := range configs {
+		if m.Name.IsUnknown() || m.Name.IsNull() || m.Name.ValueString() == "" {
+			continue
+		}
+		result = append(result, models.NetworkAttachment{
+			Name: m.Name.ValueString(),
+			Mode: valueOrEmpty(m.Mode),
+			Mac:  valueOrEmpty(m.Mac),
+		})
+	}
+	return result
+}
+
+func expandMounts(configs []mountConfigModel) []models.Mount {
+	result := make([]models.Mount, 0, len(configs))
+	for _, m := range configs {
+		if m.HostPath.ValueString() == "" || m.InstancePath.ValueString() == "" {
+			continue
+		}
+		result = append(result, models.Mount{
+			HostPath:     m.HostPath.ValueString(),
+			InstancePath: m.InstancePath.ValueString(),
+			ReadOnly:     m.ReadOnly.ValueBool(),
+		})
+	}
+	return result
+}
+
+func mountConfigToModel(m mountConfigModel) models.Mount {
+	return models.Mount{
+		HostPath:     m.HostPath.ValueString(),
+		InstancePath: m.InstancePath.ValueString(),
+		ReadOnly:     m.ReadOnly.ValueBool(),
+	}
+}
+
+func diffMounts(plan, state []mountConfigModel) (toAdd, toRemove []mountConfigModel) {
+	planMap := mountConfigMap(plan)
+	stateMap := mountConfigMap(state)
+
+	for key, current := range stateMap {
+		desired, exists := planMap[key]
+		if !exists {
+			toRemove = append(toRemove, current)
+			continue
+		}
+		if current.ReadOnly.ValueBool() != desired.ReadOnly.ValueBool() {
+			toRemove = append(toRemove, current)
+			toAdd = append(toAdd, desired)
+		}
+	}
+
+	for key, desired := range planMap {
+		if _, exists := stateMap[key]; !exists {
+			toAdd = append(toAdd, desired)
+		}
+	}
+
+	return
+}
+
+func mountConfigMap(configs []mountConfigModel) map[string]mountConfigModel {
+	result := make(map[string]mountConfigModel, len(configs))
+	for _, c := range configs {
+		host := c.HostPath.ValueString()
+		instance := c.InstancePath.ValueString()
+		if host == "" || instance == "" {
+			continue
+		}
+		key := host + "|" + instance
+		result[key] = c
+	}
+	return result
+}
+
+func valueOrEmpty(v types.String) string {
+	if v.IsNull() || v.IsUnknown() {
+		return ""
+	}
+	return v.ValueString()
+}
+
+func hasStringValue(v types.String) bool {
+	return !v.IsNull() && !v.IsUnknown() && v.ValueString() != ""
+}
+
+func valueOrDefaultString(v types.String, def string) string {
+	if v.IsNull() || v.IsUnknown() || v.ValueString() == "" {
+		return def
+	}
+	return v.ValueString()
+}
+
+func valueOrDefaultInt(v types.Int64, def int) int {
+	if v.IsNull() || v.IsUnknown() {
+		return def
+	}
+	return int(v.ValueInt64())
+}
+
+// waitForInstanceAfterTimeout polls for an instance after a launch timeout.
+// Uses ListInstances (multipass list) which only queries the daemon and does
+// not require SSH — important because multipass info relies on SSH which may
+// be unavailable on a still-booting instance or one with custom cloud-init.
+func (r *instanceResource) waitForInstanceAfterTimeout(ctx context.Context, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	pollInterval := 5 * time.Second
+
+	for time.Now().Before(deadline) {
+		instances, err := r.client.ListInstances(ctx, true)
+		if err == nil {
+			for _, inst := range instances {
+				if inst.Name == name {
+					state := strings.ToLower(inst.State)
+					if state == "running" || state == "stopped" || state == "suspended" {
+						return nil
+					}
+					// Instance exists but in transitional state, keep polling
+				}
+			}
+		}
+		// Instance not found yet or transient error — keep polling
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+
+	return fmt.Errorf("instance %q did not become available within %s after launch timeout", name, timeout)
+}
+
+// waitForCloudInit runs `cloud-init status --wait` inside the instance,
+// which blocks until cloud-init reaches a terminal state (done/error/disabled).
+func (r *instanceResource) waitForCloudInit(ctx context.Context, name string) error {
+	if err := r.client.Exec(ctx, name, []string{"cloud-init", "status", "--wait"}); err != nil {
+		return fmt.Errorf("cloud-init did not finish successfully on instance %q: %w. "+
+			"Check logs with: multipass exec %s -- cat /var/log/cloud-init-output.log", name, err, name)
+	}
+	return nil
+}

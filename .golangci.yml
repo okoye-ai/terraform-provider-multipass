@@ -1,0 +1,18 @@
+version: "2"
+
+# Moderate set, per IMPROVEMENT_PLAN.md item 1.2: bug- and correctness-classes,
+# no nitpicks. gofmt is enforced here rather than via a separate make target.
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    # Wraps %w/error comparisons misuse (fmt.Errorf without %w, == on errors).
+    - errorlint
+    # Flags loops that could preallocate a slice (perf hygiene in hot paths).
+    - prealloc
+
+formatters:
+  enable:
+    - gofmt

@@ -1,0 +1,3 @@
+# Default owners — every PR requires review from the repository owner.
+# Adjust to a team handle once maintainer teams are set up in the org.
+*       @okoye-ai @kaiwedekind

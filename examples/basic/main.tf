@@ -1,0 +1,35 @@
+terraform {
+
+  required_providers {
+    multipass = {
+      source  = "okoye-ai/multipass"
+    }
+  }
+}
+
+provider "multipass" {
+  default_image = "lts"
+}
+
+data "multipass_images" "lts" {
+  alias = "lts"
+}
+
+resource "multipass_instance" "dev" {
+  name   = "dev-box"
+  image  = data.multipass_images.lts.images[0].name
+  cpus   = 2
+  memory = "4G"
+  disk   = "15G"
+
+  networks {
+    name = "Wi-Fi"
+  }
+}
+
+resource "multipass_alias" "shell" {
+  name     = "dev-shell"
+  instance = multipass_instance.dev.name
+  command  = "bash"
+}
+

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report unexpected or broken behavior in the provider
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect instead? Include the exact resource behavior, not only the error.
+    validations:
+      required: true
+  - type: code
+    id: config
+    attributes:
+      label: Terraform configuration
+      description: Minimal `main.tf` that reproduces it. Redact anything sensitive — `cloud_init` files and file contents especially.
+      render: hcl
+    validations:
+      required: true
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider version
+      description: "`terraform version` reports it, or the `dev` build commit."
+    validations:
+      required: true
+  - type: input
+    id: terraform-version
+    attributes:
+      label: Terraform / OpenTofu version
+    validations:
+      required: true
+  - type: input
+    id: multipass-version
+    attributes:
+      label: Multipass CLI version
+      description: "Output of `multipass version`. The provider requires >= 1.13; some behavior differs in newer CLIs."
+    validations:
+      required: true
+  - type: input
+    id: host-os
+    attributes:
+      label: Host OS and Multipass driver
+      description: "macOS (hyperkit/qemu/virtualbox), Linux (lxd), Windows (hyperv) — `multipass get local.driver`."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug output
+      description: "`TF_LOG=DEBUG` output of the failing `terraform apply`. Truncate as needed."
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context

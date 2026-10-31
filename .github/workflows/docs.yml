@@ -1,0 +1,57 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate documentation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # tfplugindocs 0.25.0 requires Go 1.25.8 or newer.
+          go-version: '1.26.x'
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.16.4'
+          terraform_wrapper: false
+      - name: Validate Registry documentation and local links
+        shell: pwsh
+        run: ./scripts/validate-docs.ps1
+
+  docs-sync:
+    name: Docs in sync with schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.16.4'
+          terraform_wrapper: false
+
+      - name: Render docs
+        run: make docs
+
+      # `make docs` must be a no-op: fails when code/schema changes were
+      # merged without regenerating docs/ (see templates/ for the sources).
+      - name: Check docs are committed and current
+        run: git diff --exit-code docs/

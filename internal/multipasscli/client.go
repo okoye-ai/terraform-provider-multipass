@@ -1,0 +1,702 @@
+package multipasscli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/okoye-ai/terraform-provider-multipass/internal/models"
+)
+
+// ansiRegex matches ANSI escape sequences (CSI codes, cursor movement, etc.)
+// emitted by the Multipass CLI on Windows.
+var ansiRegex = regexp.MustCompile(`(\x1b\[[0-9;]*[A-Za-z]|\r\n|\r)`)
+
+// Client exposes typed helpers for interacting with the Multipass CLI.
+type Client interface {
+	Version(ctx context.Context) (string, error)
+	ListInstances(ctx context.Context, refresh bool) ([]models.Instance, error)
+	GetInstance(ctx context.Context, name string) (*models.Instance, error)
+	GetInstanceResources(ctx context.Context, name string) (models.InstanceResources, error)
+	SetInstanceResource(ctx context.Context, name string, setting ResourceSetting, value uint64) error
+	LaunchInstance(ctx context.Context, opts models.LaunchOptions) error
+	Exec(ctx context.Context, instance string, command []string) error
+	StartInstance(ctx context.Context, name string) error
+	StopInstance(ctx context.Context, name string, force bool) error
+	SuspendInstance(ctx context.Context, name string) error
+	RestartInstance(ctx context.Context, name string) error
+	DeleteInstance(ctx context.Context, name string, purge bool) error
+	RecoverInstance(ctx context.Context, name string) error
+	SetPrimary(ctx context.Context, name string) error
+	ListImages(ctx context.Context, refresh bool) ([]models.Image, error)
+	ListNetworks(ctx context.Context, refresh bool) ([]models.Network, error)
+	ListAliases(ctx context.Context, refresh bool) ([]models.Alias, error)
+	CreateAlias(ctx context.Context, alias models.Alias) error
+	DeleteAlias(ctx context.Context, name string) error
+	ListSnapshots(ctx context.Context, instance string) ([]models.Snapshot, error)
+	CreateSnapshot(ctx context.Context, instance, name, comment string) (string, error)
+	DeleteSnapshot(ctx context.Context, instance, name string, purge bool) error
+	Mount(ctx context.Context, instance string, mount models.Mount) error
+	Unmount(ctx context.Context, instance string, mount models.Mount) error
+	Transfer(ctx context.Context, opts TransferOptions) error
+	TransferCapture(ctx context.Context, opts TransferOptions) ([]byte, error)
+}
+
+// Config controls the multipass CLI client instantiation.
+type Config struct {
+	BinaryPath    string
+	Timeout       int    // Seconds
+	ServerAddress string // Overrides MULTIPASS_SERVER_ADDRESS for this client's subprocesses when non-empty.
+}
+
+type client struct {
+	binaryPath    string
+	timeout       time.Duration
+	serverAddress string
+
+	mu sync.Mutex
+
+	instanceCache *cacheEntry[[]models.Instance]
+	imageCache    *cacheEntry[[]models.Image]
+	networkCache  *cacheEntry[[]models.Network]
+	aliasCache    *cacheEntry[[]models.Alias]
+}
+
+// TransferOptions controls multipass transfer behavior.
+type TransferOptions struct {
+	Sources     []string
+	Destination string
+	Recursive   bool
+	Parents     bool
+	// Stdin, when non-nil, is piped to `multipass transfer` as the source
+	// (using `-`). This avoids writing a temporary file, which can fail on
+	// snap-confined multipass installs that cannot read host paths such as
+	// /tmp. Sources is ignored when Stdin is set.
+	Stdin []byte
+}
+
+const (
+	defaultTimeout  = 10 * time.Minute
+	cacheTTL        = 3 * time.Second
+	jsonFormatFlag  = "--format"
+	jsonFormatValue = "json"
+)
+
+// NewClient validates the supplied configuration and returns an initialized Client.
+func NewClient(ctx context.Context, cfg Config) (Client, error) {
+	binary := cfg.BinaryPath
+	if binary == "" {
+		binary = "multipass"
+	}
+
+	if !strings.Contains(binary, "/") && !strings.Contains(binary, "\\") {
+		// Look up in PATH to produce early errors.
+		if _, err := exec.LookPath(binary); err != nil {
+			return nil, fmt.Errorf("unable to find multipass binary %q in PATH: %w", binary, err)
+		}
+	}
+
+	timeout := defaultTimeout
+	if cfg.Timeout > 0 {
+		timeout = time.Duration(cfg.Timeout) * time.Second
+	}
+
+	return &client{
+		binaryPath:    binary,
+		timeout:       timeout,
+		serverAddress: cfg.ServerAddress,
+	}, nil
+}
+
+func (c *client) Version(ctx context.Context) (string, error) {
+	var payload versionResponse
+	if err := c.runJSON(ctx, &payload, "version"); err != nil {
+		return "", err
+	}
+	return payload.Multipass, nil
+}
+
+func (c *client) ListInstances(ctx context.Context, refresh bool) ([]models.Instance, error) {
+	c.mu.Lock()
+	if !refresh && c.instanceCache.valid(time.Now()) {
+		defer c.mu.Unlock()
+		return cloneInstances(c.instanceCache.value), nil
+	}
+	c.mu.Unlock()
+
+	var payload listResponse
+	if err := c.runJSON(ctx, &payload, "list"); err != nil {
+		return nil, err
+	}
+
+	instances := payload.toModel()
+
+	c.mu.Lock()
+	c.instanceCache = newCacheEntry(instances, cacheTTL)
+	c.mu.Unlock()
+
+	return cloneInstances(instances), nil
+}
+
+func (c *client) GetInstance(ctx context.Context, name string) (*models.Instance, error) {
+	var payload infoResponse
+	if err := c.runJSON(ctx, &payload, "info", name); err != nil {
+		if errorsIsNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	inst, err := payload.toModel(name)
+	if err != nil {
+		return nil, err
+	}
+
+	return inst, nil
+}
+
+func (c *client) LaunchInstance(ctx context.Context, opts models.LaunchOptions) error {
+	for _, mount := range opts.Mounts {
+		if mount.ReadOnly {
+			return fmt.Errorf("read-only mounts are not supported by the Multipass CLI")
+		}
+	}
+	if opts.CloudInitInline != "" && opts.CloudInitFile != "" {
+		return fmt.Errorf("only one of CloudInitInline or CloudInitFile may be set")
+	}
+
+	args := []string{"launch"}
+	if opts.Name != "" {
+		args = append(args, "--name", opts.Name)
+	}
+	if opts.Image != "" {
+		args = append(args, opts.Image)
+	}
+	if opts.CPUs > 0 {
+		args = append(args, "--cpus", fmt.Sprintf("%d", opts.CPUs))
+	}
+	if opts.Memory != "" {
+		args = append(args, "--memory", opts.Memory)
+	}
+	if opts.Disk != "" {
+		args = append(args, "--disk", opts.Disk)
+	}
+	// Inline cloud-init is piped via stdin (`--cloud-init -`) so we don't
+	// have to stage a temporary file that snap-confined multipass installs
+	// cannot read. File-based cloud-init is passed through as a path; the
+	// user is responsible for placing it somewhere multipass can see.
+	var stdin []byte
+	if opts.CloudInitInline != "" {
+		args = append(args, "--cloud-init", "-")
+		stdin = []byte(opts.CloudInitInline)
+	} else if opts.CloudInitFile != "" {
+		args = append(args, "--cloud-init", opts.CloudInitFile)
+	}
+	for _, net := range opts.Networks {
+		if net.Name == "" {
+			continue
+		}
+		value := net.Name
+		var extras []string
+		if net.Mode != "" {
+			extras = append(extras, fmt.Sprintf("mode=%s", net.Mode))
+		}
+		if net.Mac != "" {
+			extras = append(extras, fmt.Sprintf("mac=%s", net.Mac))
+		}
+		if len(extras) > 0 {
+			value = strings.Join(append([]string{"name=" + net.Name}, extras...), ",")
+		}
+		args = append(args, "--network", value)
+	}
+	for _, mount := range opts.Mounts {
+		if mount.HostPath == "" || mount.InstancePath == "" {
+			continue
+		}
+		spec := fmt.Sprintf("%s:%s", mount.HostPath, mount.InstancePath)
+		args = append(args, "--mount", spec)
+	}
+
+	// Align the Multipass CLI's own --timeout with the context deadline (which
+	// may come from a per-resource timeout) or fall back to the client default.
+	cliTimeout := c.timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			cliTimeout = remaining
+		}
+	}
+	args = append(args, "--timeout", fmt.Sprintf("%d", int(cliTimeout.Seconds())))
+
+	if _, err := c.runWithStdin(ctx, stdin, args...); err != nil {
+		return err
+	}
+
+	c.invalidateInstances()
+	return nil
+}
+
+func (c *client) Exec(ctx context.Context, instance string, command []string) error {
+	if instance == "" {
+		return fmt.Errorf("instance name is required for exec")
+	}
+	if len(command) == 0 {
+		return fmt.Errorf("exec command cannot be empty")
+	}
+
+	args := make([]string, 0, 3+len(command))
+	args = append(args, "exec", instance, "--")
+	args = append(args, command...)
+
+	if _, err := c.run(ctx, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *client) StartInstance(ctx context.Context, name string) error {
+	return c.runSimple(ctx, "start", name)
+}
+
+func (c *client) StopInstance(ctx context.Context, name string, force bool) error {
+	// force maps to `multipass stop --force` (CLI >= 1.14): immediate,
+	// potentially corrupting shutdown. The delayed-shutdown cancellation flag
+	// (`--cancel`) is a separate operation and is never inferred from force.
+	args := []string{"stop"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, name)
+	if _, err := c.run(ctx, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *client) SuspendInstance(ctx context.Context, name string) error {
+	return c.runSimple(ctx, "suspend", name)
+}
+
+func (c *client) RestartInstance(ctx context.Context, name string) error {
+	return c.runSimple(ctx, "restart", name)
+}
+
+func (c *client) DeleteInstance(ctx context.Context, name string, purge bool) error {
+	args := []string{"delete"}
+	if purge {
+		args = append(args, "--purge")
+	}
+	args = append(args, name)
+	if err := c.runSimple(ctx, args...); err != nil {
+		return err
+	}
+	c.invalidateInstances()
+	return nil
+}
+
+func (c *client) RecoverInstance(ctx context.Context, name string) error {
+	return c.runSimple(ctx, "recover", name)
+}
+
+func (c *client) SetPrimary(ctx context.Context, name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required to set primary")
+	}
+	arg := fmt.Sprintf("client.primary-name=%s", name)
+	return c.runSimple(ctx, "set", arg)
+}
+
+func (c *client) ListImages(ctx context.Context, refresh bool) ([]models.Image, error) {
+	c.mu.Lock()
+	if !refresh && c.imageCache.valid(time.Now()) {
+		defer c.mu.Unlock()
+		return cloneImages(c.imageCache.value), nil
+	}
+	c.mu.Unlock()
+
+	var payload findResponse
+	if err := c.runJSON(ctx, &payload, "find"); err != nil {
+		return nil, err
+	}
+
+	images := payload.toModel()
+
+	c.mu.Lock()
+	c.imageCache = newCacheEntry(images, cacheTTL)
+	c.mu.Unlock()
+
+	return cloneImages(images), nil
+}
+
+func (c *client) ListNetworks(ctx context.Context, refresh bool) ([]models.Network, error) {
+	c.mu.Lock()
+	if !refresh && c.networkCache.valid(time.Now()) {
+		defer c.mu.Unlock()
+		return cloneNetworks(c.networkCache.value), nil
+	}
+	c.mu.Unlock()
+
+	var payload networksResponse
+	if err := c.runJSON(ctx, &payload, "networks"); err != nil {
+		return nil, err
+	}
+
+	networks := payload.toModel()
+
+	c.mu.Lock()
+	c.networkCache = newCacheEntry(networks, cacheTTL)
+	c.mu.Unlock()
+
+	return cloneNetworks(networks), nil
+}
+
+func (c *client) ListAliases(ctx context.Context, refresh bool) ([]models.Alias, error) {
+	c.mu.Lock()
+	if !refresh && c.aliasCache.valid(time.Now()) {
+		defer c.mu.Unlock()
+		return cloneAliases(c.aliasCache.value), nil
+	}
+	c.mu.Unlock()
+
+	var payload aliasesResponse
+	if err := c.runJSON(ctx, &payload, "aliases"); err != nil {
+		return nil, err
+	}
+
+	aliases := payload.toModel()
+
+	c.mu.Lock()
+	c.aliasCache = newCacheEntry(aliases, cacheTTL)
+	c.mu.Unlock()
+
+	return cloneAliases(aliases), nil
+}
+
+func (c *client) CreateAlias(ctx context.Context, alias models.Alias) error {
+	if alias.Name == "" || alias.Instance == "" || alias.Command == "" {
+		return fmt.Errorf("alias requires name, instance, and command")
+	}
+	args := make([]string, 0, 4)
+	args = append(args, "alias", "--no-map-working-directory")
+
+	command := aliasCommand(alias.Command, alias.WorkingDirectory)
+
+	args = append(args, fmt.Sprintf("%s:%s", alias.Instance, command))
+	args = append(args, alias.Name)
+
+	if _, err := c.run(ctx, args...); err != nil {
+		return err
+	}
+	c.invalidateAliases()
+	return nil
+}
+
+func (c *client) DeleteAlias(ctx context.Context, name string) error {
+	if name == "" {
+		return fmt.Errorf("alias name is required")
+	}
+	if _, err := c.run(ctx, "unalias", name); err != nil {
+		return err
+	}
+	c.invalidateAliases()
+	return nil
+}
+
+func (c *client) ListSnapshots(ctx context.Context, instance string) ([]models.Snapshot, error) {
+	var payload snapshotListResponse
+	if err := c.runJSON(ctx, &payload, "list", "--snapshots"); err != nil {
+		return nil, err
+	}
+	return payload.toModel(instance), nil
+}
+
+func (c *client) CreateSnapshot(ctx context.Context, instance, name, comment string) (string, error) {
+	if instance == "" {
+		return "", fmt.Errorf("instance name is required for snapshots")
+	}
+	args := []string{"snapshot"}
+	if name != "" {
+		args = append(args, "--name", name)
+	}
+	if comment != "" {
+		args = append(args, "--comment", comment)
+	}
+	args = append(args, instance)
+
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+
+	// Output format: "Snapshot taken: instance.snapshotName"
+	// Strip ANSI escape sequences that Multipass emits on Windows.
+	line := strings.TrimSpace(ansiRegex.ReplaceAllString(string(out), ""))
+	if line == "" {
+		// Fall back to the requested name.
+		return name, nil
+	}
+	parts := strings.Split(line, ":")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	if last == "" {
+		return name, nil
+	}
+	// last is "instance.snapshot"
+	if dot := strings.Index(last, "."); dot != -1 && dot+1 < len(last) {
+		return last[dot+1:], nil
+	}
+	return name, nil
+}
+
+func (c *client) DeleteSnapshot(ctx context.Context, instance, name string, purge bool) error {
+	if instance == "" || name == "" {
+		return fmt.Errorf("instance and snapshot name are required")
+	}
+	target := fmt.Sprintf("%s.%s", instance, name)
+	args := []string{"delete"}
+	if purge {
+		args = append(args, "--purge")
+	}
+	args = append(args, target)
+	if _, err := c.run(ctx, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *client) Mount(ctx context.Context, instance string, mount models.Mount) error {
+	if mount.ReadOnly {
+		return fmt.Errorf("read-only mounts are not supported by the Multipass CLI")
+	}
+	if instance == "" {
+		return fmt.Errorf("instance name is required for mount")
+	}
+	if mount.HostPath == "" {
+		return fmt.Errorf("host path is required for mount")
+	}
+	if mount.InstancePath == "" {
+		return fmt.Errorf("instance path is required for mount")
+	}
+
+	target := fmt.Sprintf("%s:%s", instance, mount.InstancePath)
+
+	if _, err := c.run(ctx, "mount", mount.HostPath, target); err != nil {
+		return err
+	}
+
+	c.invalidateInstances()
+	return nil
+}
+
+func (c *client) Unmount(ctx context.Context, instance string, mount models.Mount) error {
+	if instance == "" {
+		return fmt.Errorf("instance name is required for umount")
+	}
+
+	var args []string
+	if mount.InstancePath == "" {
+		// No path -> unmount all mounts for this instance, per Multipass CLI docs.
+		args = []string{"umount", instance}
+	} else {
+		path := mount.InstancePath
+		target := fmt.Sprintf("%s:%s", instance, path)
+		args = []string{"umount", target}
+	}
+
+	if _, err := c.run(ctx, args...); err != nil {
+		return err
+	}
+
+	c.invalidateInstances()
+	return nil
+}
+
+func (c *client) Transfer(ctx context.Context, opts TransferOptions) error {
+	if opts.Stdin == nil && len(opts.Sources) == 0 {
+		return fmt.Errorf("at least one source is required for transfer")
+	}
+	if opts.Destination == "" {
+		return fmt.Errorf("destination path is required for transfer")
+	}
+
+	args := buildTransferArgs(opts)
+
+	if _, err := c.runWithStdin(ctx, opts.Stdin, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *client) TransferCapture(ctx context.Context, opts TransferOptions) ([]byte, error) {
+	if opts.Stdin != nil {
+		// Capture reads bytes from multipass into memory (destination="-").
+		// Combining that with stdin input (source="-") would be nonsensical
+		// and would cause multipass to block waiting for data.
+		return nil, fmt.Errorf("stdin input is not supported for capture transfers")
+	}
+	if len(opts.Sources) == 0 {
+		return nil, fmt.Errorf("at least one source is required for transfer")
+	}
+	if opts.Destination == "" {
+		return nil, fmt.Errorf("destination path is required for transfer")
+	}
+
+	args := buildTransferArgs(opts)
+	return c.run(ctx, args...)
+}
+
+func buildTransferArgs(opts TransferOptions) []string {
+	args := []string{"transfer"}
+	if opts.Recursive {
+		args = append(args, "--recursive")
+	}
+	if opts.Parents {
+		args = append(args, "--parents")
+	}
+	if opts.Stdin != nil {
+		args = append(args, "-")
+	} else {
+		args = append(args, opts.Sources...)
+	}
+	args = append(args, opts.Destination)
+	return args
+}
+
+func (c *client) runSimple(ctx context.Context, args ...string) error {
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+func (c *client) runJSON(ctx context.Context, dest any, args ...string) error {
+	args = append(args, jsonFormatFlag, jsonFormatValue)
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(out, dest); err != nil {
+		return fmt.Errorf("unable to parse multipass JSON output for %q: %w", strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func (c *client) run(ctx context.Context, args ...string) ([]byte, error) {
+	return c.runWithStdin(ctx, nil, args...)
+}
+
+func (c *client) runWithStdin(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+	// Respect per-operation deadlines set by the caller (e.g. per-resource
+	// timeouts). Only apply the client-level default when the context does
+	// not already carry a deadline.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(ctx, c.binaryPath, args...)
+	if c.serverAddress != "" {
+		// Set only the child environment so provider aliases can target different
+		// daemons concurrently. os/exec uses the last value for duplicate keys
+		// (case-insensitively on Windows), preserving the rest of the environment.
+		cmd.Env = append(cmd.Environ(), "MULTIPASS_SERVER_ADDRESS="+c.serverAddress)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+
+	err := cmd.Run()
+	if err == nil {
+		return stdout.Bytes(), nil
+	}
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("%w: %s", ErrTimeout, strings.Join(args, " "))
+	}
+
+	stdoutStr := strings.TrimSpace(ansiRegex.ReplaceAllString(stdout.String(), ""))
+	stderrStr := strings.TrimSpace(ansiRegex.ReplaceAllString(stderr.String(), ""))
+
+	if strings.Contains(stderrStr, "does not exist") || strings.Contains(stderrStr, "not found") {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, stderrStr)
+	}
+
+	// Detect Multipass CLI's own --timeout errors
+	if isTimeoutError(stderrStr) {
+		return nil, fmt.Errorf("%w: %s", ErrTimeout, stderrStr)
+	}
+
+	return nil, &CLIError{
+		Command: strings.Join(args, " "),
+		Stdout:  stdoutStr,
+		Stderr:  stderrStr,
+		Err:     err,
+	}
+}
+
+func (c *client) invalidateInstances() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.instanceCache = nil
+}
+
+func (c *client) invalidateAliases() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.aliasCache = nil
+}
+
+func cloneInstances(in []models.Instance) []models.Instance {
+	out := make([]models.Instance, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneImages(in []models.Image) []models.Image {
+	out := make([]models.Image, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneNetworks(in []models.Network) []models.Network {
+	out := make([]models.Network, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneAliases(in []models.Alias) []models.Alias {
+	out := make([]models.Alias, len(in))
+	copy(out, in)
+	return out
+}
+
+// aliasCommand returns the command string for a multipass alias. When dir is
+// non-empty the command is wrapped so it executes in that directory.
+//
+// The wrapper uses bash -c '...' (single-quoted) for the outer layer so the
+// host shell / multipass stores it literally. Inside that:
+//   - dir is double-quoted so bash handles spaces and literal single quotes
+//   - a single quote in dir or command closes the outer quoting, inserts
+//     an escaped literal quote, then reopens the outer quoting
+func aliasCommand(command, dir string) string {
+	if dir != "" {
+		escapedDir := strings.ReplaceAll(dir, "'", `'\''`)
+		escapedCmd := strings.ReplaceAll(command, "'", `'\''`)
+		return fmt.Sprintf(`bash -c 'cd "%s" && exec %s'`, escapedDir, escapedCmd)
+	}
+	return command
+}
+
+func errorsIsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrNotFound)
+}

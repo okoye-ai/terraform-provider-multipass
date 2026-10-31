@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pre-commit gate: same checks CI enforces (lint + unit tests), run locally.
+#
+# Install:  git config core.hooksPath .githooks
+# Bypass:   GITHOOK_SKIP=1 git commit ...  (emergency only — CI still runs lint/tests)
+set -euo pipefail
+
+if [[ "${GITHOOK_SKIP:-}" == "1" ]]; then
+  echo "pre-commit: skipped (GITHOOK_SKIP=1)"
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+# Find golangci-lint on PATH, falling back to the default `go install` location.
+lint_bin="$(command -v golangci-lint || true)"
+if [[ -z "$lint_bin" && -x "$HOME/go/bin/golangci-lint" ]]; then
+  lint_bin="$HOME/go/bin/golangci-lint"
+fi
+
+if [[ -n "$lint_bin" ]]; then
+  echo "pre-commit: golangci-lint run"
+  "$lint_bin" run
+else
+  echo "pre-commit: golangci-lint not found — linting skipped." >&2
+  echo "pre-commit: install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0" >&2
+  echo "pre-commit: CI will still enforce it." >&2
+fi
+
+echo "pre-commit: go test ./..."
+go test ./...
+
+echo "pre-commit: OK"

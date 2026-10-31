@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a new resource, attribute, or behavior
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or missing capability
+      description: What are you trying to do with Multipass that the provider does not support?
+    validations:
+      required: true
+  - type: code
+    id: hcl
+    attributes:
+      label: Example of the desired interface
+      description: The HCL you wish existed (rough shape is fine).
+      render: hcl
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds tried
+      description: Existing attributes, `provisioner` workarounds, or direct CLI use.
+  - type: checkboxes
+    id: cli-support
+    attributes:
+      label: Multipass CLI support
+      description: Does `multipass` itself (any version >= 1.13) already support the underlying capability?
+      options:
+        - label: Yes — the CLI does this, the provider does not expose it
+        - label: No — this would need a Multipass feature first
+        - label: Not sure
